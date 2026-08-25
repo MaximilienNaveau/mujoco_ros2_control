@@ -21,9 +21,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -232,6 +234,15 @@ private:
   const mjModel* mj_model_;
   mjData* mj_camera_data_;
 
+  // Which OpenGL backend the rendering thread should use: "auto", "glfw" or "egl".
+  //
+  // This is not just a headless/desktop switch. GLFW renders through the X display, which is
+  // also where the Simulate viewer draws, so on a desktop the cameras and the viewer end up
+  // sharing one GL queue and the cameras lose frames whenever the viewer is busy. EGL's
+  // surfaceless context does not go through X at all, so selecting it explicitly keeps the
+  // viewer open without putting the camera renders behind it.
+  std::string render_backend_{ "auto" };
+
   // Image publishing rate (applies to streaming cameras only)
   double camera_publish_rate_{ 5.0 };
   rclcpp::Time last_publish_time_{ 0, 0, RCL_ROS_TIME };
@@ -280,13 +291,52 @@ private:
 
   // Number of streaming slots skipped because the renderer was still busy. Counted per
   // slot rather than per attempt, so it reads as "frames lost", not "times we looked".
-  uint64_t dropped_frames_{ 0 };
+  // Atomic because the sim thread increments it while the rendering thread reads it to decide
+  // how loudly to report the cost of a pass.
+  std::atomic<uint64_t> dropped_frames_{ 0 };
+
+  // Value of dropped_frames_ at the last cost report, so a pass can tell whether anything was
+  // actually lost since then.
+  uint64_t reported_drops_{ 0 };
+
+  // Wall-clock cost of the last render pass, split by stage and summed over the cameras
+  // rendered in it. Only ever touched by the rendering thread, so no synchronisation.
+  // Reported through a throttled debug log: when frames are being dropped, the useful
+  // question is which stage is over budget, and the three differ by more than an order of
+  // magnitude (pixel readback typically dwarfs the draw call itself).
+  double pass_gl_seconds_{ 0.0 };
+  double pass_convert_seconds_{ 0.0 };
+  double pass_publish_seconds_{ 0.0 };
 
   // EGL context for headless rendering (used when GLFW is unavailable)
   EGLDisplay egl_display_{ EGL_NO_DISPLAY };
   EGLContext egl_context_{ EGL_NO_CONTEXT };
   EGLSurface egl_surface_{ EGL_NO_SURFACE };
   bool use_egl_{ false };
+
+  /**
+   * @brief Apply a stereo depth-camera model to one exact depth sample.
+   *
+   * MuJoCo returns exact geometric depth everywhere, which no real sensor does. Without
+   * this, anything built on the depth stream is tuned against a sensor that does not
+   * exist. Returns NaN -- the ROS convention for "no data" in a 32FC1 image -- outside
+   * the usable range and for dropped pixels.
+   */
+  float modelDepth(float true_depth, const CameraData& camera);
+
+  // Depth sensor model, defaults matching the D435i datasheet.
+  bool depth_sensor_model_{ true };
+  float depth_min_range_{ 0.28f };          ///< [m] Min-Z; below this the sensor returns nothing.
+  float depth_max_range_{ 3.0f };           ///< [m] beyond the ideal range.
+  float depth_stereo_baseline_{ 0.05f };    ///< [m] IR pair separation.
+  float depth_subpixel_error_{ 0.15f };     ///< [px] disparity matching error; ~1% at 2 m.
+  double depth_dropout_fraction_{ 0.02 };   ///< Fraction of pixels returning nothing.
+
+  // Deterministic by default so a recording can be reproduced; seed it differently if
+  // independent noise per run is wanted.
+  std::mt19937 noise_generator_{ 42 };
+  std::normal_distribution<double> noise_distribution_{ 0.0, 1.0 };
+  std::uniform_real_distribution<double> dropout_distribution_{ 0.0, 1.0 };
 
   /**
    * @brief Initializes EGL context for headless rendering.

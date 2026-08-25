@@ -50,15 +50,34 @@ bool CameraPlugin::init(rclcpp::Node::SharedPtr node, const mjModel* model, mjDa
   }
 
   // Start the rendering thread process
-  // Try GLFW first, fall back to EGL for headless environments
-  if (glfw_init_fn())
+  if (render_backend_ == "egl")
   {
+    // Asked for explicitly, so do not touch GLFW at all: the point of choosing EGL on a
+    // machine that has a display is to stay off the X queue the viewer draws on.
+    RCLCPP_INFO(node_->get_logger(), "Using EGL for camera rendering (render_backend=egl).");
+    use_egl_ = true;
+  }
+  else if (render_backend_ == "glfw")
+  {
+    if (!glfw_init_fn())
+    {
+      RCLCPP_ERROR(node_->get_logger(), "render_backend=glfw was requested but GLFW failed to initialize.");
+      return false;
+    }
     use_egl_ = false;
   }
   else
   {
-    RCLCPP_WARN(node_->get_logger(), "Failed to initialize GLFW. Attempting EGL for headless rendering.");
-    use_egl_ = true;
+    // Try GLFW first, fall back to EGL for headless environments
+    if (glfw_init_fn())
+    {
+      use_egl_ = false;
+    }
+    else
+    {
+      RCLCPP_WARN(node_->get_logger(), "Failed to initialize GLFW. Attempting EGL for headless rendering.");
+      use_egl_ = true;
+    }
   }
   rendering_thread_ = std::thread(&CameraPlugin::update_loop, this);
   return true;
@@ -113,8 +132,9 @@ void CameraPlugin::update(const mjModel* model_arg, mjData* data)
         RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
                              "Camera rendering cannot keep up: %llu streaming frame(s) dropped so far. "
                              "Reduce mujoco_plugins.mujoco_camera_plugin.camera_publish_rate, the camera "
-                             "resolution, or the number of streaming cameras.",
-                             static_cast<unsigned long long>(dropped_frames_));
+                             "resolution, or the number of streaming cameras; or lower sim_speed_factor, which "
+                             "keeps the sim-time image rate and gives each pass more wall-clock time.",
+                             static_cast<unsigned long long>(dropped_frames_.load()));
       }
       return;
     }
@@ -194,6 +214,67 @@ bool CameraPlugin::register_cameras()
 
   camera_publish_rate_ = node_->get_parameter(camera_publish_rate_param).as_double();
   RCLCPP_INFO(node_->get_logger(), "Publishing camera data at rate %f per second.", camera_publish_rate_);
+
+  // Depth sensor model. MuJoCo returns exact geometric depth at every pixel: no noise,
+  // no invalid returns, and values below the real Min-Z. A map or an estimator built
+  // against that looks far better in simulation than it can on hardware, so the sensor
+  // is modelled here rather than letting the consumer discover the difference on the
+  // robot.
+  if (!node_->has_parameter(param_prefix + "depth_sensor_model"))
+  {
+    node_->declare_parameter(param_prefix + "depth_sensor_model", true);
+  }
+  depth_sensor_model_ = node_->get_parameter(param_prefix + "depth_sensor_model").as_bool();
+  if (!node_->has_parameter(param_prefix + "depth_min_range"))
+  {
+    node_->declare_parameter(param_prefix + "depth_min_range", 0.28);
+  }
+  depth_min_range_ = static_cast<float>(
+      node_->get_parameter(param_prefix + "depth_min_range").as_double());
+  if (!node_->has_parameter(param_prefix + "depth_max_range"))
+  {
+    node_->declare_parameter(param_prefix + "depth_max_range", 3.0);
+  }
+  depth_max_range_ = static_cast<float>(
+      node_->get_parameter(param_prefix + "depth_max_range").as_double());
+  if (!node_->has_parameter(param_prefix + "depth_stereo_baseline"))
+  {
+    node_->declare_parameter(param_prefix + "depth_stereo_baseline", 0.05);
+  }
+  depth_stereo_baseline_ = static_cast<float>(
+      node_->get_parameter(param_prefix + "depth_stereo_baseline").as_double());
+  if (!node_->has_parameter(param_prefix + "depth_subpixel_error"))
+  {
+    node_->declare_parameter(param_prefix + "depth_subpixel_error", 0.15);
+  }
+  depth_subpixel_error_ = static_cast<float>(
+      node_->get_parameter(param_prefix + "depth_subpixel_error").as_double());
+  if (!node_->has_parameter(param_prefix + "depth_dropout_fraction"))
+  {
+    node_->declare_parameter(param_prefix + "depth_dropout_fraction", 0.02);
+  }
+  depth_dropout_fraction_ = node_->get_parameter(param_prefix + "depth_dropout_fraction").as_double();
+  if (depth_sensor_model_)
+  {
+    RCLCPP_INFO(node_->get_logger(),
+                "Depth sensor model ON: range [%.2f, %.2f] m, stereo baseline %.3f m, "
+                "subpixel error %.3f px, dropout %.1f%%. Invalid pixels are NaN.",
+                depth_min_range_, depth_max_range_, depth_stereo_baseline_,
+                depth_subpixel_error_, 100.0 * depth_dropout_fraction_);
+  }
+
+  if (!node_->has_parameter(param_prefix + "render_backend"))
+  {
+    node_->declare_parameter(param_prefix + "render_backend", "auto");
+  }
+  render_backend_ = node_->get_parameter(param_prefix + "render_backend").as_string();
+  if (render_backend_ != "auto" && render_backend_ != "glfw" && render_backend_ != "egl")
+  {
+    RCLCPP_ERROR(node_->get_logger(),
+                 "Unknown render_backend '%s'; expected \"auto\", \"glfw\" or \"egl\".",
+                 render_backend_.c_str());
+    return false;
+  }
 
   cameras_.resize(0);
   for (auto i = 0; i < mj_model_->ncam; ++i)
@@ -434,10 +515,37 @@ bool CameraPlugin::init_egl_context()
     return false;
   }
 
-  // Make the context current
+  // Make the context current.
+  //
+  // The pbuffer above is requested for drivers that need a real draw surface, but the
+  // surfaceless platform does not require one and at least the NVIDIA driver refuses to bind
+  // a pbuffer here once the process already holds a GLX context (as it does whenever the
+  // Simulate viewer is open): eglMakeCurrent returns false while eglGetError reports success.
+  // MuJoCo only ever renders into its own offscreen framebuffer, so binding with no surface
+  // at all is equivalent, and it is what the surfaceless platform is for. Try the pbuffer
+  // first so drivers that do want one keep working, then fall back.
   if (!eglMakeCurrent(egl_display_, egl_surface_, egl_surface_, egl_context_))
   {
-    RCLCPP_ERROR(node_->get_logger(), "EGL: Failed to make context current (error: 0x%x)", eglGetError());
+    RCLCPP_WARN(node_->get_logger(),
+                "EGL: Could not bind the PBuffer surface (error: 0x%x). Retrying surfaceless, which is "
+                "sufficient because rendering targets an offscreen framebuffer.",
+                eglGetError());
+    if (egl_surface_ != EGL_NO_SURFACE)
+    {
+      eglDestroySurface(egl_display_, egl_surface_);
+      egl_surface_ = EGL_NO_SURFACE;
+    }
+    if (eglMakeCurrent(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context_))
+    {
+      RCLCPP_INFO(node_->get_logger(), "EGL: Successfully initialized headless OpenGL context (surfaceless)");
+      return true;
+    }
+    RCLCPP_ERROR(node_->get_logger(),
+                 "EGL: Failed to make context current (error: 0x%x). If the Simulate viewer is open, that "
+                 "is the cause: this driver refuses to bind an EGL context in a process that already holds "
+                 "a GLX one, and eglGetError misreports it as success. Use render_backend=egl only "
+                 "together with headless, or leave render_backend at auto to render through GLFW.",
+                 eglGetError());
     cleanup_egl_context();
     return false;
   }
@@ -610,14 +718,100 @@ void CameraPlugin::update_cameras()
   const rclcpp::Duration duration = rclcpp::Duration::from_seconds(mj_camera_data_->time);
   rclcpp::Time stamp(duration.nanoseconds(), RCL_ROS_TIME);
 
+  pass_gl_seconds_ = 0.0;
+  pass_convert_seconds_ = 0.0;
+  pass_publish_seconds_ = 0.0;
+
   for (const auto idx : render_indices_)
   {
     render_and_publish_camera(cameras_[idx], stamp);
   }
+
+  // Report the cost split. The three stages differ by more than an order of magnitude, so
+  // saying which one dominates turns "cannot keep up" into an actionable message.
+  //
+  // Escalate to WARN only when frames were actually lost since the last report, rather than
+  // when the pass outlasts 1/camera_publish_rate. The publish interval is measured on the sim
+  // clock, so the wall-clock budget for a pass is 1/(rate * real-time factor): with the
+  // simulation deliberately slowed a pass may take far longer than 1/rate and still drop
+  // nothing. Keying off the drop counter is correct at any speed factor.
+  const double pass_seconds = pass_gl_seconds_ + pass_convert_seconds_ + pass_publish_seconds_;
+  const char* const fmt = "Render pass: %zu camera(s) in %.1f ms "
+                          "(render+readback %.1f, convert %.1f, publish %.1f) -> ceiling %.1f Hz";
+  const uint64_t drops = dropped_frames_.load();
+  const bool losing_frames = drops > reported_drops_;
+  reported_drops_ = drops;
+  if (losing_frames)
+  {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000, fmt, render_indices_.size(),
+                         1e3 * pass_seconds, 1e3 * pass_gl_seconds_, 1e3 * pass_convert_seconds_,
+                         1e3 * pass_publish_seconds_, 1.0 / pass_seconds);
+  }
+  else
+  {
+    RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000, fmt, render_indices_.size(),
+                          1e3 * pass_seconds, 1e3 * pass_gl_seconds_, 1e3 * pass_convert_seconds_,
+                          1e3 * pass_publish_seconds_, pass_seconds > 0.0 ? 1.0 / pass_seconds : 0.0);
+  }
+}
+
+float CameraPlugin::modelDepth(float true_depth, const CameraData& camera)
+{
+  // Outside the usable range a stereo depth camera returns nothing, and the ROS
+  // convention for "no data" in a 32FC1 depth image is NaN. Reporting a number here is
+  // what lets a consumer silently trust geometry the real sensor could never provide:
+  // MuJoCo happily returns 0.2477 m, well inside the D435i's 0.28 m Min-Z.
+  if (!(true_depth >= depth_min_range_) || true_depth > depth_max_range_)
+  {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+
+  // Holes. Real depth drops out on low-texture, specular and occluded surfaces, none of
+  // which MuJoCo knows about, so this is a blunt stand-in for their FREQUENCY rather
+  // than their spatial structure -- real dropouts come in patches, these do not.
+  if (depth_dropout_fraction_ > 0.0 && dropout_distribution_(noise_generator_) < depth_dropout_fraction_)
+  {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+
+  // Stereo triangulation error, which grows with the SQUARE of range because depth is
+  // inversely proportional to disparity:
+  //     sigma(Z) = Z^2 * subpixel / (focal_px * baseline)
+  //
+  // Derived from the geometry rather than fixed as a percentage, so it stays right if
+  // the resolution or field of view changes. At the 0.15 px default, with the 50 mm
+  // baseline and this rig's intrinsics, that is:
+  //
+  //            fx 617 (colour/depth)      fx 433 (infra)
+  //   0.5 m       1.2 mm  (0.24%)          1.7 mm  (0.35%)
+  //   1.0 m       4.9 mm  (0.49%)          6.9 mm  (0.69%)
+  //   2.0 m      19.4 mm  (0.97%)         27.7 mm  (1.39%)
+  //   3.0 m      43.7 mm  (1.46%)         62.4 mm  (2.08%)
+  //
+  // About 1% at 2 m, which is the typical figure reported for a D435i rather than the
+  // datasheet's "<2% at 2 m" worst case. Raise depth_subpixel_error to roughly 0.3 px
+  // to sit on that bound instead; the parameter is the honest place to express how
+  // pessimistic you want to be.
+  // The very focal length published in camera_info, so the noise matches the geometry
+  // the consumer will actually reproject with.
+  const float focal_px = static_cast<float>(camera.camera_info.k[0]);
+  const float sigma = true_depth * true_depth * depth_subpixel_error_ /
+                      std::max(1e-6f, focal_px * depth_stereo_baseline_);
+  const float noisy = true_depth + sigma * static_cast<float>(noise_distribution_(noise_generator_));
+  // Noise can push a sample out of range; it is still a reading the sensor would not
+  // return.
+  if (!(noisy >= depth_min_range_) || noisy > depth_max_range_)
+  {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  return noisy;
 }
 
 void CameraPlugin::render_and_publish_camera(CameraData& camera, const rclcpp::Time& stamp)
 {
+  using clock = std::chrono::steady_clock;
+  const auto t_start = clock::now();
+
   // Step 1: Render the scene and copy images to relevant camera data containers.
   // Render scene
   mjv_updateScene(mj_model_, mj_camera_data_, &mjv_opt_, NULL, &camera.mjv_cam, mjCAT_ALL, &mjv_scn_);
@@ -625,6 +819,8 @@ void CameraPlugin::render_and_publish_camera(CameraData& camera, const rclcpp::T
 
   // Copy image into relevant buffers
   mjr_readPixels(camera.image_buffer.data(), camera.depth_buffer.data(), camera.viewport, &mjr_con_);
+
+  const auto t_read = clock::now();
 
   // Step 2: Adjust the images and copy depth data.
   // Fix non-linear depth buffer and flip it vertically (OpenGL's origin is the bottom left)
@@ -636,7 +832,8 @@ void CameraPlugin::render_and_publish_camera(CameraData& camera, const rclcpp::T
     float* dst_row = depth_out + static_cast<size_t>(camera.height - 1 - h) * camera.width;
     for (uint32_t w = 0; w < camera.width; ++w)
     {
-      dst_row[w] = camera_near_distance_ / (1.0f - src_row[w] * camera_depth_scale_);
+      const float true_depth = camera_near_distance_ / (1.0f - src_row[w] * camera_depth_scale_);
+      dst_row[w] = depth_sensor_model_ ? modelDepth(true_depth, camera) : true_depth;
     }
   }
 
@@ -649,6 +846,8 @@ void CameraPlugin::render_and_publish_camera(CameraData& camera, const rclcpp::T
     std::memcpy(&camera.image.data[dest_idx], &camera.image_buffer[src_idx], row_size);
   }
 
+  const auto t_convert = clock::now();
+
   // Step 3: Publish the images and camera info.
   camera.image.header.stamp = stamp;
   camera.depth_image.header.stamp = stamp;
@@ -657,6 +856,11 @@ void CameraPlugin::render_and_publish_camera(CameraData& camera, const rclcpp::T
   camera.image_pub->publish(camera.image);
   camera.depth_image_pub->publish(camera.depth_image);
   camera.camera_info_pub->publish(camera.camera_info);
+
+  const auto t_publish = clock::now();
+  pass_gl_seconds_ += std::chrono::duration<double>(t_read - t_start).count();
+  pass_convert_seconds_ += std::chrono::duration<double>(t_convert - t_read).count();
+  pass_publish_seconds_ += std::chrono::duration<double>(t_publish - t_convert).count();
 }
 
 void CameraPlugin::handle_trigger(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
