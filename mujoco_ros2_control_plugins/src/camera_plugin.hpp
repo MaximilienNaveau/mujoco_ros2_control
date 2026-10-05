@@ -197,6 +197,11 @@ public:
   }
 
 private:
+  // Grants tests direct access to the rendering-thread handshake below, so the
+  // render-in-flight guard in update() can be driven deterministically instead of by racing
+  // a real render pass against the clock. See test/camera_plugin_test_helper.hpp.
+  friend class CameraPluginTestHelper;
+
   // ROS interfaces
   rclcpp::Logger logger_{ rclcpp::get_logger("CameraPlugin") };
 
