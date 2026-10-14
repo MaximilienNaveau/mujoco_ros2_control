@@ -83,6 +83,10 @@ def add_mujoco_info(raw_xml, output_filepath, publish_topic, fuse=True):
     compiler_element.setAttribute("discardvisual", "false")
     compiler_element.setAttribute("strippath", "false")
 
+    # Take mass only from the URDF <inertial> tags. Otherwise MuJoCo adds mass at its
+    # default density for the collision geoms synthesized below on links without one.
+    compiler_element.setAttribute("inertiafromgeom", "false")
+
     if not fuse:
         # Prevents merging of static bodies (like the fixed root link)
         compiler_element.setAttribute("fusestatic", "false")
@@ -113,7 +117,40 @@ def remove_tag(xml_string, tag_to_remove):
     return xmldoc.toprettyxml()
 
 
-def add_missing_collisions(xml_string):
+def replace_urdf_collisions(xml_string, replace_collision_urdf_dict):
+    """
+    Replaces every <collision> of each named URDF link with the user-authored <collision>
+    elements of a stage="urdf" replace_collision tag.
+
+    Running on the URDF (before MuJoCo compiles it) means replacement meshes go through the
+    normal mesh conversion, and links on fixed joints are fused by MuJoCo like any other.
+
+    :param xml_string: the URDF as a string
+    :param replace_collision_urdf_dict: link name -> list of <collision> elements
+    :returns: the URDF string with the collisions replaced (unchanged if the dict is empty)
+    :raises ValueError: if a named link is not in the URDF
+    """
+    if not replace_collision_urdf_dict:
+        return xml_string
+
+    dom = minidom.parseString(xml_string)
+    links = {lnk.getAttribute("name"): lnk for lnk in dom.getElementsByTagName("link")}
+
+    unmatched = sorted(set(replace_collision_urdf_dict) - set(links))
+    if unmatched:
+        raise ValueError(f"replace_collision link(s) not found in the URDF: {', '.join(unmatched)}")
+
+    for link_name, fragment in replace_collision_urdf_dict.items():
+        link = links[link_name]
+        for collision in [c for c in link.childNodes if c.nodeType == c.ELEMENT_NODE and c.tagName == "collision"]:
+            link.removeChild(collision)
+        for element in fragment:
+            link.appendChild(dom.importNode(element, True))
+
+    return dom.toxml()
+
+
+def add_missing_collisions(xml_string, exclude_links=None):
     """
     Ensures every link that can be rendered can also collide, while respecting any
     collision geometry the URDF author already provided.
@@ -129,13 +166,24 @@ def add_missing_collisions(xml_string):
     when present, copied from the visual otherwise) is used for physics.
 
     :param xml_string: the URDF as a string
+    :param exclude_links: optional iterable of link names to leave collision-free - e.g.
+        links whose collision will be replaced by a user-authored fragment (the
+        replace_collision processed_inputs tag). Any collision already present on such a
+        link (authored or otherwise) is stripped, and none is synthesized from its
+        visuals, so its original collision mesh never enters mesh_info_dict.
     :returns: the URDF string with synthesized collisions added where they were missing
     """
+    exclude_links = set(exclude_links) if exclude_links else set()
     dom = minidom.parseString(xml_string)
 
     for link in dom.getElementsByTagName("link"):
         visuals = [c for c in link.childNodes if c.nodeType == c.ELEMENT_NODE and c.tagName == "visual"]
         collisions = [c for c in link.childNodes if c.nodeType == c.ELEMENT_NODE and c.tagName == "collision"]
+
+        if link.getAttribute("name") in exclude_links:
+            for collision in collisions:
+                link.removeChild(collision)
+            continue
 
         # Respect authored collisions and skip links with nothing to render.
         if collisions or not visuals:
@@ -943,15 +991,34 @@ def get_processed_mujoco_inputs(processed_inputs_element):
     Returns the processed inputs as dictionaries from the specified processed_inputs_element.
 
     Right now this supports tags for decomposing meshes and attaching cameras or lidar sensors to sites.
+
+    replace_collision tags are split by their optional stage attribute: stage="mjcf" (default)
+    entries hold <geom>/<body> elements and go to replace_collision_dict, stage="urdf" entries
+    hold <collision> elements and go to replace_collision_urdf_dict. Both map link name to the
+    list of child elements.
+
+    :returns: (decompose_dict, cameras_dict, modify_element_dict, lidar_dict,
+        replace_collision_dict, replace_collision_urdf_dict)
+    :raises ValueError: on malformed tags, e.g. a replace_collision with an unknown stage,
+        children that don't match its stage, or a link named in more than one such tag.
     """
 
     decompose_dict = dict()
     cameras_dict = dict()
     modify_element_dict = dict()
     lidar_dict = dict()
+    replace_collision_dict = dict()
+    replace_collision_urdf_dict = dict()
 
     if not processed_inputs_element:
-        return decompose_dict, cameras_dict, modify_element_dict, lidar_dict
+        return (
+            decompose_dict,
+            cameras_dict,
+            modify_element_dict,
+            lidar_dict,
+            replace_collision_dict,
+            replace_collision_urdf_dict,
+        )
 
     for child in processed_inputs_element.childNodes:
         if child.nodeType != child.ELEMENT_NODE:
@@ -1049,7 +1116,48 @@ def get_processed_mujoco_inputs(processed_inputs_element):
             for key_attr, value in attr_dict.items():
                 print(f"  {key_attr}: {value}")
 
-    return decompose_dict, cameras_dict, modify_element_dict, lidar_dict
+        # Grab collision-replacement fragments
+        if child.tagName == "replace_collision":
+            link_name = child.getAttribute("link")
+            if not link_name:
+                raise ValueError("'link' must be in the attributes of a 'replace_collision' tag!")
+            if link_name in replace_collision_dict or link_name in replace_collision_urdf_dict:
+                raise ValueError(f"Multiple 'replace_collision' tags found for link '{link_name}'")
+
+            stage = child.getAttribute("stage") or "mjcf"
+            allowed_tags = {"mjcf": {"geom", "body"}, "urdf": {"collision"}}.get(stage)
+            if allowed_tags is None:
+                raise ValueError(
+                    f"'replace_collision' tag for link '{link_name}' has invalid stage '{stage}' "
+                    "(expected 'mjcf' or 'urdf')"
+                )
+
+            fragment = [c for c in child.childNodes if c.nodeType == c.ELEMENT_NODE]
+            if not fragment:
+                raise ValueError(
+                    f"'replace_collision' tag for link '{link_name}' must contain at least one "
+                    f"child element ({' or '.join(sorted(allowed_tags))})!"
+                )
+            # One tag is either all URDF or all MJCF, never a mix
+            wrong = sorted({c.tagName for c in fragment} - allowed_tags)
+            if wrong:
+                raise ValueError(
+                    f"'replace_collision' tag for link '{link_name}' with stage '{stage}' only accepts "
+                    f"{' or '.join(sorted(allowed_tags))} children, got: {', '.join(wrong)}"
+                )
+
+            target = replace_collision_urdf_dict if stage == "urdf" else replace_collision_dict
+            target[link_name] = fragment
+            print(f"Will replace collision(s) on link '{link_name}' at {stage} stage with {len(fragment)} element(s)")
+
+    return (
+        decompose_dict,
+        cameras_dict,
+        modify_element_dict,
+        lidar_dict,
+        replace_collision_dict,
+        replace_collision_urdf_dict,
+    )
 
 
 def parse_inputs_xml(filename=None):
@@ -1500,6 +1608,71 @@ def add_lidar_from_sites(dom, lidar_dict):
     unmatched = set(lidar_dict.keys()) - matched_sites
     if unmatched:
         raise ValueError(f"Lidar site(s) not found in the MJCF: {', '.join(sorted(unmatched))}")
+
+    return dom
+
+
+def add_replaced_collisions(dom, replace_collision_dict, urdf=None):
+    """
+    Inserts each link's replace_collision fragment (one or more <geom>/<body> elements,
+    parsed by get_processed_mujoco_inputs) into that link's <body> in the MJCF, verbatim.
+
+    The fragment's elements are deep-imported as-is (name/type/size/fromto/pos/nested
+    <body>/... all preserved exactly as authored). The one default applied: any <geom> in
+    the fragment that does not already carry a class attribute is given class="collision",
+    so it still picks up sane group/contype/conaffinity defaults.
+
+    A link on a fixed joint is fused by MuJoCo into its parent (unless --no-fuse) and has no
+    <body> of its own. When urdf is given, such a link's fragment is wrapped in a <body> named
+    after the link, carrying the accumulated fixed-joint pose (the same transform used to place
+    link sites), and added to the body that absorbed it, so the fragment stays authored in the
+    link's own frame.
+
+    :param dom: the MJCF as a minidom document
+    :param replace_collision_dict: link name -> list of fragment elements
+    :param urdf: optional URDF string, used to place fragments of fused links
+    :returns: the modified dom
+    :raises ValueError: if a link has no <body> and no parent body to attach to, e.g. urdf not
+        given, or a root link fused into the world.
+    """
+    if not replace_collision_dict:
+        return dom
+
+    bodies = {b.getAttribute("name"): b for b in dom.getElementsByTagName("body")}
+    tfs = get_urdf_transforms(urdf) if urdf else {}
+    unmatched = []
+
+    for link_name, fragment in replace_collision_dict.items():
+        target = bodies.get(link_name)
+        if target is None and link_name in tfs:
+            parent, tf, _ = tfs[link_name]
+            if parent != link_name and parent in bodies:
+                target = dom.createElement("body")
+                target.setAttribute("name", link_name)
+                target.setAttribute("pos", " ".join(map(str, tf.p)))
+                x, y, z, w = tf.M.GetQuaternion()  # MuJoCo wants w x y z
+                target.setAttribute("quat", f"{w} {x} {y} {z}")
+                bodies[parent].appendChild(target)
+        if target is None:
+            unmatched.append(link_name)
+            continue
+
+        for element in fragment:
+            imported = dom.importNode(element, True)
+            target.appendChild(imported)
+
+            # a <geom> can't have child geoms, so these two cases are mutually exclusive
+            geoms = [imported] if imported.tagName == "geom" else imported.getElementsByTagName("geom")
+            for geom in geoms:
+                if not geom.hasAttribute("class"):
+                    geom.setAttribute("class", "collision")
+
+    if unmatched:
+        raise ValueError(
+            f"replace_collision link(s) not found in the MJCF: {', '.join(sorted(unmatched))}. "
+            "A root link fused into the world has no body to attach to; "
+            "use --no-fuse (or a free joint) to keep it as its own body."
+        )
 
     return dom
 

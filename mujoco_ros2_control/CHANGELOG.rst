@@ -2,6 +2,20 @@
 Changelog for package mujoco_ros2_control
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.3 (2026-10-08)
+------------------
+* Add a way to replace collision meshes upon MJCF conversion (`#310 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/310>`_)
+* Fix constant 1ms physics loop sleep duration affecting high frequency simulations (`#317 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/317>`_)
+* Apply transmissions consistently in read() and write() (`#313 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/313>`_)
+* Align to default camera at startup (`#316 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/316>`_)
+* Log noise type and value of each of the sensor components (`#314 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/314>`_)
+* sibling links reuse already-decomposed collision meshes instead of redecomposing (`#268 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/268>`_)
+* Add support for simulating sensor noise (`#307 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/307>`_)
+* sets contype/conaffinity=0 on visual-only geoms and grouping (`#267 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/267>`_)
+* visual-only mesh fallback + visual/collision group split, refactors make_mjcf_from_robot_description.py to reuse the new logic (`#265 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/265>`_)
+* Use collision-tag meshes/info for collision geoms (primitives, STL/DAE/OBJ) (`#264 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/264>`_)
+* Contributors: Nathan Dunkelberger, Sai Kishor Kothakota, Sebastian Castro, Daniel Costanzi
+
 0.1.2 (2026-09-07)
 ------------------
 * Add world_reset plugin hook and restore eq_active on world reset (`#294 <https://github.com/ros-controls/mujoco_ros2_control/issues/294>`_)

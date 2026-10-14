@@ -2,6 +2,11 @@
 Changelog for package mujoco_ros2_control_tests
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.3 (2026-10-08)
+------------------
+* Apply transmissions consistently in read() and write() (`#313 <https://github.com/pal-robotics-forks/mujoco_ros2_control/issues/313>`_)
+* Contributors: Daniel Costanzi, Sai Kishor Kothakota
+
 0.1.2 (2026-09-07)
 ------------------
 * Add world_reset plugin hook and restore eq_active on world reset (`#294 <https://github.com/ros-controls/mujoco_ros2_control/issues/294>`_)
